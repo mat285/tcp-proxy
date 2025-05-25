@@ -17,41 +17,85 @@ type upstream struct {
 }
 
 var (
-	upstreams     []upstream
-	upstreamIndex int
-	upstreamLock  *sync.Mutex
+	upstreams      map[int][]upstream
+	upstreamsIndex map[int]int
+	upstreamLock   *sync.Mutex
 )
 
 func main() {
-	fromPortEnv := "PROXY_PORT"
-	upstreamEnvs := "PROXY_UPSTREAMS"
-	fromPort, err := strconv.Atoi(os.Getenv(fromPortEnv))
-	if err != nil || fromPort <= 0 {
+	fromPortEnv := "PROXY_PORTS"
+	fromPortEnvValue, has := os.LookupEnv(fromPortEnv)
+	if !has {
 		log.Fatalf("Environment variable %s is not set", fromPortEnv)
 		os.Exit(1)
 	}
-	upstreamStrs := strings.Split(os.Getenv(upstreamEnvs), ",")
-	if len(upstreamStrs) == 0 {
-		log.Fatalf("Environment variable %s is not set", upstreamEnvs)
+	fromPorts := strings.Split(fromPortEnvValue, ",")
+	if len(fromPorts) == 0 {
+		log.Fatalf("Environment variable %s is not set", fromPortEnv)
 		os.Exit(1)
 	}
-	if err := parseUpstreams(upstreamStrs); err != nil {
-		log.Fatalf("Error parsing upstreams: %v", err)
-		os.Exit(1)
+
+	upstreams = make(map[int][]upstream)
+	upstreamsIndex = make(map[int]int)
+	upstreamLock = &sync.Mutex{}
+
+	parsedPorts := make([]int, 0, len(fromPorts))
+	for _, port := range fromPorts {
+		port = strings.TrimSpace(port)
+		if port == "" {
+			continue
+		}
+		fromPort, err := strconv.Atoi(port)
+		if err != nil || fromPort <= 0 {
+			log.Fatalf("Invalid port number in %s: %s", fromPortEnv, port)
+			os.Exit(1)
+		}
+		parsedPorts = append(parsedPorts, fromPort)
+		upstreamEnvs := fmt.Sprintf("PROXY_UPSTREAMS_%d", fromPort)
+		upstreamEnvValue, has := os.LookupEnv(upstreamEnvs)
+		if !has {
+			log.Fatalf("Environment variable %s is not set", upstreamEnvs)
+			os.Exit(1)
+		}
+		upstreamStrs := strings.Split(upstreamEnvValue, ",")
+		if len(upstreamStrs) == 0 {
+			log.Fatalf("Environment variable %s is not set", upstreamEnvs)
+			os.Exit(1)
+		}
+		if err := parseUpstreams(upstreamStrs, fromPort); err != nil {
+			log.Fatalf("Error parsing upstreams: %v", err)
+			os.Exit(1)
+		}
 	}
-	log.Printf("Starting proxy from port %d", fromPort)
+
+	var wg sync.WaitGroup
+	for _, fromPort := range parsedPorts {
+		wg.Add(1)
+		go func(port int) {
+			defer wg.Done()
+			if err := listenPort(port); err != nil {
+				log.Printf("Error listening on port %d: %v", port, err)
+				os.Exit(1)
+			}
+		}(fromPort)
+	}
+	wg.Wait()
+	log.Println("All listeners have exited")
+}
+
+func listenPort(port int) error {
+	log.Printf("Starting proxy from port %d", port)
 
 	listener, err := net.ListenTCP("tcp", &net.TCPAddr{
-		Port: fromPort,
+		Port: port,
 		IP:   net.ParseIP("0.0.0.0"),
 	})
 
 	if err != nil {
-		log.Fatalf("Error starting TCP listener: %v", err)
-		os.Exit(1)
+		return err
 	}
 	defer listener.Close()
-	log.Printf("Listening on port %d", fromPort)
+	log.Printf("Listening on port %d", port)
 
 	for {
 		conn, err := listener.AcceptTCP()
@@ -59,22 +103,23 @@ func main() {
 			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, port)
 	}
 }
 
-func handleConnection(conn *net.TCPConn) {
+func handleConnection(conn *net.TCPConn, port int) {
 	defer conn.Close()
 	log.Printf("Accepted connection from %s", conn.RemoteAddr().String())
 
 	// Connect to the target port
-	upstreamConn, err := getNextUpstream()
+	upstreamConn, err := getNextUpstream(port)
 	if err != nil {
 		log.Printf("Error connecting to upstream: %v", err)
 		return
 	}
 	defer upstreamConn.Close()
 	log.Printf("Connected to upstream %s", upstreamConn.RemoteAddr().String())
+
 	// Start forwarding data between the two connections
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -99,7 +144,7 @@ func handleConnection(conn *net.TCPConn) {
 	log.Printf("Done forwarding connection from %s to %s", conn.RemoteAddr().String(), upstreamConn.RemoteAddr().String())
 }
 
-func parseUpstreams(upstreamStrs []string) error {
+func parseUpstreams(upstreamStrs []string, port int) error {
 	var parsed []upstream
 	for _, upstreamStr := range upstreamStrs {
 		parts := strings.Split(upstreamStr, ":")
@@ -113,18 +158,18 @@ func parseUpstreams(upstreamStrs []string) error {
 		}
 		parsed = append(parsed, upstream{IP: ip, Port: port})
 	}
-	upstreamLock = &sync.Mutex{}
-	upstreamIndex = 0
-	upstreams = parsed
+
+	upstreamsIndex[port] = 0
+	upstreams[port] = parsed
 	return nil
 }
 
-func getNextUpstream() (net.Conn, error) {
+func getNextUpstream(port int) (net.Conn, error) {
 	for i := 0; i < len(upstreams); i++ {
 		upstreamLock.Lock()
-		upstreamIndex = (upstreamIndex + 1) % len(upstreams)
+		upstreamsIndex[port] = (upstreamsIndex[port] + 1) % len(upstreams[port])
 		upstreamLock.Unlock()
-		upstream := upstreams[upstreamIndex]
+		upstream := upstreams[port][upstreamsIndex[port]]
 		upstreamConn, err := net.Dial("tcp", upstream.IP+":"+strconv.Itoa(upstream.Port))
 		if err != nil {
 			log.Printf("Error connecting to upstream %s:%d: %v", upstream.IP, upstream.Port, err)
