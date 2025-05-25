@@ -76,11 +76,26 @@ func handleConnection(conn *net.TCPConn) {
 	defer upstreamConn.Close()
 	log.Printf("Connected to upstream %s", upstreamConn.RemoteAddr().String())
 	// Start forwarding data between the two connections
-	_, err = io.Copy(upstreamConn, conn)
-	if err != nil {
-		log.Printf("Error forwarding data to upstream: %v", err)
-		return
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(conn, upstreamConn)
+		if err != nil {
+			log.Printf("Error forwarding data to client: %v", err)
+			return
+		}
+		log.Printf("Done forwarding connection from %s to %s", upstreamConn.RemoteAddr().String(), conn.RemoteAddr().String())
+	}()
+	go func() {
+		defer wg.Done()
+		_, err = io.Copy(upstreamConn, conn)
+		if err != nil {
+			log.Printf("Error forwarding data to upstream: %v", err)
+			return
+		}
+	}()
+	wg.Wait()
 	log.Printf("Done forwarding connection from %s to %s", conn.RemoteAddr().String(), upstreamConn.RemoteAddr().String())
 }
 
