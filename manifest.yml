@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ingress-proxy
+  namespace: ingress-nginx
+spec:
+  selector:
+    matchLabels:
+      app: ingress-proxy
+  template:
+    metadata:
+      labels:
+        app: ingress-proxy
+    spec:
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      hostNetwork: true  # Share the host's network
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: proxy
+        image: mat285/ingress-proxy:latest
+        env:
+          - name: PROXY_PORTS
+            value: 80,443
+          - name: PROXY_UPSTREAMS_80
+            value: "localhost:30080"
+          - name: PROXY_UPSTREAMS_443
+            value: "localhost:30443"
+        ports:
+        - containerPort: 80
+        securityContext:
+          capabilities:
+            add: ["NET_BIND_SERVICE"]
